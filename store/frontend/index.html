@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Store Demo (RabbitMQ Integration)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 2rem auto;
+        }
+        h2 { border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+        input, select, button {
+            margin: 6px 0;
+            padding: 6px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        button.inline { width: 49%; display: inline-block; }
+        #output {
+            margin-top: 1rem;
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            padding: 1rem;
+            min-height: 80px;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+        .status-success { color: green; font-weight: bold; }
+        .status-failed { color: red; font-weight: bold; }
+        .status-processing { color: orange; font-weight: bold; }
+    </style>
+</head>
+<body>
+<h1>Store Demo (RabbitMQ Integration)</h1>
+
+<h2>Account</h2>
+<div>
+    <input id="username" placeholder="Username" />
+    <input id="password" placeholder="Password" type="password" />
+    <button class="inline" onclick="toggleRegister()">Sign Up</button>
+    <button class="inline" onclick="login()">Login</button>
+</div>
+
+<div id="registerFields" style="display:none;">
+    <input id="firstName" placeholder="First Name" />
+    <input id="lastName" placeholder="Last Name" />
+    <input id="email" placeholder="Email" />
+    <input id="address" placeholder="Address" />
+    <button onclick="register()">Create Account</button>
+</div>
+
+<h2>Place Order</h2>
+<select id="product">
+    <option value="1">Laptop ($1200)</option>
+    <option value="2">Phone ($800)</option>
+    <option value="3">TV ($1500)</option>
+</select>
+<input id="quantity" type="number" placeholder="Quantity" min="1" value="1" />
+<button onclick="placeOrder()">Place Order</button>
+
+<h2>Cancel Latest Order</h2>
+<button onclick="cancelLatest()">Cancel Latest Order</button>
+
+<h2>Response</h2>
+<div id="output">Waiting for actions...</div>
+
+<script>
+    const API_BASE = "http://localhost:8080/api";
+    let token = null;
+    let latestOrderId = null;
+    let registerVisible = false;
+    let pollInterval = null;
+
+    function show(msg, statusClass = "") {
+        const output = document.getElementById("output");
+        output.className = statusClass;
+        output.textContent = JSON.stringify(msg, null, 2);
+    }
+
+    function toggleRegister() {
+        registerVisible = !registerVisible;
+        document.getElementById("registerFields").style.display = registerVisible ? "block" : "none";
+    }
+
+    async function register() {
+        const body = {
+            username: username.value,
+            password: password.value,
+            firstName: firstName.value,
+            lastName: lastName.value,
+            email: email.value,
+            address: address.value
+        };
+        try {
+            const res = await fetch(`${API_BASE}/auth/register`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body)
+            });
+            const text = await res.text();
+            show({ message: "Registration response", response: text }, "status-success");
+            toggleRegister();
+        } catch (err) {
+            show({ error: err.message }, "status-failed");
+        }
+    }
+
+    async function login() {
+        try {
+            const res = await fetch(`${API_BASE}/auth/login`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    username: username.value,
+                    password: password.value
+                })
+            });
+            const data = await res.json();
+            token = data.token;
+            window.customerId = data.customerId;
+            show({ message: "Login successful", username: data.username, token });
+        } catch (err) {
+            show({ error: err.message });
+        }
+    }
+
+    async function placeOrder() {
+        if (!token) return show({ error: "Please login first" }, "status-failed");
+
+        const productId = document.getElementById("product").value;
+        const quantity = document.getElementById("quantity").value;
+
+        show({ message: "Placing order via Store → RabbitMQ..." }, "status-processing");
+
+        try {
+            const res = await fetch(
+                `${API_BASE}/orders/place?customerId=${window.customerId}&productId=${productId}&quantity=${quantity}`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Authorization": `Bearer ${token}`,
+                        "Content-Type": "application/json"
+                    }
+                }
+            );
+
+            const data = await res.json().catch(() => null);
+
+            if (!res.ok) {
+                show({ error: data?.error || "Failed to place order" }, "status-failed");
+                return;
+            }
+
+            if (data.status === "FAILED") {
+                show({ message: "Order failed" }, "status-failed");
+                return;
+            }
+
+            latestOrderId = data.orderId;
+            const statusClass =
+                data.status === "FAILED"
+                    ? "status-failed"
+                    : data.status === "PROCESSING"
+                        ? "status-processing"
+                        : "status-success";
+
+            show({ message: "Order placed successfully", response: data }, statusClass);
+
+            // Begin polling every 5s for RabbitMQ-delivered updates
+            startPolling();
+        } catch (err) {
+            show({ error: err.message }, "status-failed");
+        }
+    }
+
+    async function cancelLatest() {
+        if (!token) return show({ error: "Please login first" }, "status-failed");
+        if (!latestOrderId) return show({ error: "No latest order to cancel" }, "status-failed");
+
+        try {
+            const res = await fetch(`${API_BASE}/orders/cancel/${latestOrderId}`, {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+
+            const data = await res.json().catch(() => null);
+            if (!res.ok) {
+                show({ error: data?.error || "Failed to cancel order" }, "status-failed");
+                return;
+            }
+
+            show({ message: "Order cancelled", response: data }, "status-success");
+            stopPolling();
+        } catch (err) {
+            show({ error: err.message }, "status-failed");
+        }
+    }
+
+    function startPolling() {
+        stopPolling();
+        pollInterval = setInterval(checkOrderStatus, 5000);
+    }
+
+    function stopPolling() {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+    }
+
+    async function checkOrderStatus() {
+        if (!latestOrderId || !token) return;
+
+        try {
+            const res = await fetch(`${API_BASE}/orders/${latestOrderId}`, {
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+
+            const status = data.status || "UNKNOWN";
+            const statusClass =
+                status === "DELIVERED"
+                    ? "status-success"
+                    : ["FAILED", "DELIVERY_LOST"].includes(status)
+                        ? "status-failed"
+                        : "status-processing";
+
+            show({ message: "Order status update", response: data }, statusClass);
+
+            if (["DELIVERED", "DELIVERY_LOST", "FAILED", "CANCELLED"].includes(status)) {
+                stopPolling();
+            }
+        } catch (err) {
+            console.error("Polling error:", err.message);
+        }
+    }
+</script>
+</body>
+</html>
